@@ -85,7 +85,7 @@ def hb_outline_embolden(points, contours, x_strength, y_strength, x_shift, y_shi
                 out_y = points[j][1] - points[i][1]
                 l_out, out_x, out_y = normalize_len(out_x, out_y)
                 out_vec = (out_x, out_y)
-                
+
                 if l_out == 0.0:
                     j = j + 1 if j < last else first
                     if j == i or i == k:
