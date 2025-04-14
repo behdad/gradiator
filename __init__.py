@@ -7,9 +7,10 @@ from fontTools.ttLib import TTFont
 from fontTools.pens.recordingPen import RecordingPointPen
 from fontTools.pens.ttGlyphPen import TTGlyphPointPen
 
+
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Embolden all simple glyphs using the EXACT port of hb_outline_t::embolden."
+        description="Embolden all simple glyphs using an optimized port of hb_outline_t::embolden."
     )
     parser.add_argument("input_font", help="Path to input TTF/OTF font")
     parser.add_argument("output_font", help="Path to output emboldened font")
@@ -24,73 +25,51 @@ def parse_args():
 
     return parser.parse_args()
 
+
 def control_area(points):
-    """
-    Equivalent of control_area() in your C++ code: returns area/2 across ALL points.
-    points: list of dicts [ {'x':..., 'y':...}, ... ]
-    """
+    """Returns area/2 using tuples"""
     area = 0.0
     num_points = len(points)
     if num_points < 2:
         return 0.0
     for i in range(num_points):
-        x1 = points[i]['x']
-        y1 = points[i]['y']
-        x2 = points[(i + 1) % num_points]['x']
-        y2 = points[(i + 1) % num_points]['y']
+        x1, y1 = points[i]
+        x2, y2 = points[(i + 1) % num_points]
         area += (x1 * y2 - x2 * y1)
     return area / 2.0
 
-def normalize_len(vec):
-    """
-    Replicates out.normalize_len() from C++.
-    vec is dict: {'x':..., 'y':...}
-    Returns the original length. Modifies vec in place to make it unit-length (if non-zero).
-    """
-    length = math.hypot(vec['x'], vec['y'])
+
+def normalize_len(x, y):
+    """Returns (length, normalized_x, normalized_y)"""
+    length = math.hypot(x, y)
     if length != 0.0:
-        vec['x'] /= length
-        vec['y'] /= length
-    return length
+        return length, x/length, y/length
+    return 0.0, 0.0, 0.0
+
 
 def hb_outline_embolden(points, contours, x_strength, y_strength, x_shift, y_shift):
     """
-    Direct Python port of:
-
-      void hb_outline_t::embolden (float x_strength, float y_strength,
-                                   float x_shift, float y_shift)
-
-    from your C++ snippet. Variable names remain identical:
-    - 'in', 'out', 'anchor', 'shift' become Python dicts { 'x':..., 'y':... }
-    - l_in, l_out, l_anchor, etc. remain floats
-    - loops replicate i, j, k iteration
-    - orientation checks a single time for the entire glyph
-
-    points:   list of dicts [ {'x': float, 'y': float}, ... ] for ALL contours
-    contours: list of endpoint indices (like 'contours[c]' in C++),
-              where contours[i] = lastPointIndexInContour+1
-    modifies 'points' in place
+    Optimized embolden function using tuples instead of dictionaries.
+    Modifies 'points' list in place.
     """
-
     if (x_strength == 0 and y_strength == 0) or not points:
         return
 
-    x_strength /= 2.0
-    y_strength /= 2.0
+    x_strength = x_strength / 2.0
+    y_strength = y_strength / 2.0
 
     orientation_negative = (control_area(points) < 0)
 
     first = 0
-    for c in range(len(contours)):
-        last = contours[c] - 1
+    for last in (c - 1 for c in contours):
         if last < first:
-            first = contours[c]
+            first = last + 1
             continue
 
-        in_ =  {'x': 0.0, 'y': 0.0 }
-        out_ = {'x': 0.0, 'y': 0.0 }
-        anchor = {'x': 0.0, 'y': 0.0 }
-        shift_ = {'x': 0.0, 'y': 0.0 }
+        in_vec = (0.0, 0.0)
+        out_vec = (0.0, 0.0)
+        anchor = (0.0, 0.0)
+        shift = (0.0, 0.0)
 
         l_in = 0.0
         l_out = 0.0
@@ -102,90 +81,80 @@ def hb_outline_embolden(points, contours, x_strength, y_strength, x_shift, y_shi
 
         while True:
             if j != k:
-                out_['x'] = points[j]['x'] - points[i]['x']
-                out_['y'] = points[j]['y'] - points[i]['y']
-                l_out = normalize_len(out_)
+                out_x = points[j][0] - points[i][0]
+                out_y = points[j][1] - points[i][1]
+                l_out, out_x, out_y = normalize_len(out_x, out_y)
+                out_vec = (out_x, out_y)
+                
                 if l_out == 0.0:
-                    # skip
-                    if j < last:
-                        j += 1
-                    else:
-                        j = first
+                    j = j + 1 if j < last else first
                     if j == i or i == k:
                         break
                     continue
             else:
-                out_ = {'x': anchor['x'], 'y': anchor['y']}
+                out_vec = anchor
                 l_out = l_anchor
 
             if l_in != 0.0:
                 if k < 0:
                     k = i
-                    anchor = {'x': in_['x'], 'y': in_['y']}
+                    anchor = in_vec
                     l_anchor = l_in
 
-                d = in_['x'] * out_['x'] + in_['y'] * out_['y']
+                d = in_vec[0] * out_vec[0] + in_vec[1] * out_vec[1]
 
                 if d > -15.0/16.0:
                     d += 1.0
 
-                    shift_['x'] = in_['y'] + out_['y']
-                    shift_['y'] = in_['x'] + out_['x']
+                    shift_x = in_vec[1] + out_vec[1]
+                    shift_y = in_vec[0] + out_vec[0]
 
                     if orientation_negative:
-                        shift_['x'] = -shift_['x']
+                        shift_x = -shift_x
                     else:
-                        shift_['y'] = -shift_['y']
+                        shift_y = -shift_y
 
-                    q = out_['x'] * in_['y'] - out_['y'] * in_['x']
+                    q = out_vec[0] * in_vec[1] - out_vec[1] * in_vec[0]
                     if orientation_negative:
                         q = -q
 
                     l = min(l_in, l_out)
 
-                    # non-strict inequalities avoid divide-by-zero when q == l == 0
                     if x_strength * q <= l * d:
-                        shift_['x'] = shift_['x'] * x_strength / d
+                        shift_x = shift_x * x_strength / d
                     else:
-                        shift_['x'] = shift_['x'] * l / q
+                        shift_x = shift_x * l / q
 
                     if y_strength * q <= l * d:
-                        shift_['y'] = shift_['y'] * y_strength / d
+                        shift_y = shift_y * y_strength / d
                     else:
-                        shift_['y'] = shift_['y'] * l / q
-                else:
-                    shift_['x'] = 0.0
-                    shift_['y'] = 0.0
+                        shift_y = shift_y * l / q
 
-                # move i forward
+                    shift = (shift_x, shift_y)
+                else:
+                    shift = (0.0, 0.0)
+
                 while i != j:
-                    points[i]['x'] += x_shift + shift_['x']
-                    points[i]['y'] += y_shift + shift_['y']
-                    if i < last:
-                        i += 1
-                    else:
-                        i = first
+                    points[i] = (
+                        points[i][0] + x_shift + shift[0],
+                        points[i][1] + y_shift + shift[1]
+                    )
+                    i = i + 1 if i < last else first
             else:
                 i = j
 
-            in_ = {'x': out_['x'], 'y': out_['y']}
+            in_vec = out_vec
             l_in = l_out
 
-            if j < last:
-                j += 1
-            else:
-                j = first
+            j = j + 1 if j < last else first
             if j == i or i == k:
                 break
 
         first = last + 1
 
+
 def flatten_glyph_to_points(glyphOps):
-    """
-    Flatten a glyph's recording-pen ops (all contours) into:
-      - points: list of {'x':..., 'y':...}
-      - contours: list of end indices
-    """
+    """Convert glyph operations to points and contours using tuples"""
     points = []
     contours = []
     start = 0
@@ -197,25 +166,22 @@ def flatten_glyph_to_points(glyphOps):
             operator, args = item
             kwargs = {}
 
-        if operator == "beginPath":
-            pass
-        elif operator == "addPoint":
+        if operator == "addPoint":
             ((x, y), segType, smooth, name, *rest) = args
-            points.append({'x': x, 'y': y})
+            points.append((x, y))
         elif operator == "endPath":
             if len(points) > start:
                 contours.append(len(points))
             start = len(points)
-        # ignore addComponent
+
     return points, contours
 
+
 def rebuild_glyph_ops(points, contours, originalOps):
-    """
-    Rebuild a new .value for the RecordingPointPen using updated points,
-    while preserving segmentType, smooth, name, etc. in the same order.
-    """
+    """Rebuild glyph operations with modified points"""
     outVal = []
-    idx = 0  # point index across entire glyph
+    idx = 0
+
     for item in originalOps:
         if len(item) == 3:
             operator, args, kwargs = item
@@ -228,18 +194,17 @@ def rebuild_glyph_ops(points, contours, originalOps):
         elif operator == "addPoint":
             ((xOld, yOld), segType, smooth, name, *rest) = args
             ident = rest[0] if rest else None
-
-            newX = points[idx]['x']
-            newY = points[idx]['y']
+            newX, newY = points[idx]
             idx += 1
-
             newArgs = ((newX, newY), segType, smooth, name, ident)
             outVal.append((operator, newArgs, {}))
         elif operator == "endPath":
             outVal.append((operator, (), {}))
         else:
             outVal.append((operator, args, kwargs))
+
     return outVal
+
 
 def main():
     args = parse_args()
@@ -253,34 +218,37 @@ def main():
         if glyph.isComposite():
             continue
 
-        # 1) Record existing outline
+        # Record existing outline
         recpen = RecordingPointPen()
         glyphSet[gName].drawPoints(recpen)
         ops = recpen.value
 
-        # 2) Flatten
+        # Flatten to points and contours
         points, contours = flatten_glyph_to_points(ops)
         if not points:
             continue
 
-        # 3) Embolden EXACT C++ logic
-        hb_outline_embolden(points, contours,
-                            x_strength=args.x_strength,
-                            y_strength=args.y_strength,
-                            x_shift=args.x_shift,
-                            y_shift=args.y_shift)
+        # Embolden
+        hb_outline_embolden(
+            points, contours,
+            x_strength=args.x_strength,
+            y_strength=args.y_strength,
+            x_shift=args.x_shift,
+            y_shift=args.y_shift
+        )
 
-        # 4) Rebuild pen ops
+        # Rebuild glyph operations
         newOps = rebuild_glyph_ops(points, contours, ops)
         recpen.value = newOps
 
-        # 5) Replay into TTGlyph
+        # Replay into TTGlyph
         ttpen = TTGlyphPointPen(glyphSet)
         recpen.replay(ttpen)
         glyf[gName] = ttpen.glyph()
 
     font.save(args.output_font)
     print(f"Saved emboldened font to {args.output_font}")
+
 
 if __name__ == "__main__":
     main()
